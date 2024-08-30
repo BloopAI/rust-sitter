@@ -4,9 +4,17 @@ use syn::{parse_quote, Item};
 mod expansion;
 use expansion::*;
 
+/// Extra information specified by a grammar, such as a custom scanner `c` source.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Metadata {
+    pub scanner_c: Option<String>,
+    // Header name-content pairs
+    pub extra_headers: std::collections::HashMap<String, String>,
+}
+
 /// Generates JSON strings defining Tree Sitter grammars for every Rust Sitter
 /// grammar found in the given module and recursive submodules.
-pub fn generate_grammars(root_file: &Path) -> Vec<Value> {
+pub fn generate_grammars(root_file: &Path) -> Vec<(Value, Metadata)> {
     let root_file = syn_inline_mod::parse_and_inline_modules(root_file).items;
     let mut out = vec![];
     root_file
@@ -15,7 +23,7 @@ pub fn generate_grammars(root_file: &Path) -> Vec<Value> {
     out
 }
 
-fn generate_all_grammars(item: &Item, out: &mut Vec<Value>) {
+fn generate_all_grammars(item: &Item, out: &mut Vec<(Value, Metadata)>) {
     if let Item::Mod(m) = item {
         m.content
             .iter()
@@ -47,93 +55,112 @@ pub fn build_parsers(root_file: &Path) {
     let emit_artifacts: bool = env::var("RUST_SITTER_EMIT_ARTIFACTS")
         .map(|s| s.parse().unwrap_or(false))
         .unwrap_or(false);
-    generate_grammars(root_file).iter().for_each(|grammar| {
-        let (grammar_name, grammar_c) =
-            generate::generate_parser_for_grammar(&grammar.to_string()).unwrap();
-        let tempfile = tempfile::Builder::new()
-            .prefix("grammar")
-            .tempdir()
-            .unwrap();
-
-        let dir = if emit_artifacts {
-            let grammar_dir = Path::new(out_dir.as_str()).join(format!("grammar_{grammar_name}",));
-            std::fs::remove_dir_all(&grammar_dir).expect("Couldn't clear old artifacts");
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .create(grammar_dir.clone())
-                .expect("Couldn't create grammar JSON directory");
-            grammar_dir
-        } else {
-            tempfile.path().into()
-        };
-
-        let grammar_file = dir.join("parser.c");
-        let mut f = std::fs::File::create(grammar_file).unwrap();
-
-        f.write_all(grammar_c.as_bytes()).unwrap();
-        drop(f);
-
-        // emit grammar into the build out_dir
-        let mut grammar_json_file =
-            std::fs::File::create(dir.join(format!("{grammar_name}.json"))).unwrap();
-        grammar_json_file
-            .write_all(serde_json::to_string_pretty(grammar).unwrap().as_bytes())
-            .unwrap();
-        drop(grammar_json_file);
-
-        let header_dir = dir.join("tree_sitter");
-        std::fs::create_dir(&header_dir).unwrap();
-        let mut parser_file = std::fs::File::create(header_dir.join("parser.h")).unwrap();
-        parser_file
-            .write_all(tree_sitter::PARSER_HEADER.as_bytes())
-            .unwrap();
-        drop(parser_file);
-
-        let sysroot_dir = dir.join("sysroot");
-        if env::var("TARGET").unwrap().starts_with("wasm32") {
-            std::fs::create_dir(&sysroot_dir).unwrap();
-            let mut stdint = std::fs::File::create(sysroot_dir.join("stdint.h")).unwrap();
-            stdint
-                .write_all(include_bytes!("wasm-sysroot/stdint.h"))
+    generate_grammars(root_file)
+        .iter()
+        .for_each(|(grammar, metadata)| {
+            let (grammar_name, grammar_c) =
+                generate::generate_parser_for_grammar(&grammar.to_string()).unwrap();
+            let tempfile = tempfile::Builder::new()
+                .prefix("grammar")
+                .tempdir()
                 .unwrap();
-            drop(stdint);
 
-            let mut stdlib = std::fs::File::create(sysroot_dir.join("stdlib.h")).unwrap();
-            stdlib
-                .write_all(include_bytes!("wasm-sysroot/stdlib.h"))
+            let dir = if emit_artifacts {
+                let grammar_dir =
+                    Path::new(out_dir.as_str()).join(format!("grammar_{grammar_name}",));
+                std::fs::remove_dir_all(&grammar_dir).expect("Couldn't clear old artifacts");
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .create(grammar_dir.clone())
+                    .expect("Couldn't create grammar JSON directory");
+                grammar_dir
+            } else {
+                tempfile.path().into()
+            };
+
+            let grammar_file = dir.join("parser.c");
+            let mut f = std::fs::File::create(grammar_file).unwrap();
+            f.write_all(grammar_c.as_bytes()).unwrap();
+            drop(f);
+
+            if let Some(scanner_c) = &metadata.scanner_c {
+                let scanner_file = dir.join("scanner.c");
+                let mut f = std::fs::File::create(scanner_file).unwrap();
+                f.write_all(scanner_c.as_bytes()).unwrap();
+            }
+
+            for (header_name, header_content) in metadata.extra_headers.iter() {
+                let header_file = dir.join(format!("{header_name}.h"));
+                let mut f = std::fs::File::create(header_file).unwrap();
+                f.write_all(header_content.as_bytes()).unwrap();
+            }
+
+            // emit grammar into the build out_dir
+            let mut grammar_json_file =
+                std::fs::File::create(dir.join(format!("{grammar_name}.json"))).unwrap();
+            grammar_json_file
+                .write_all(serde_json::to_string_pretty(grammar).unwrap().as_bytes())
                 .unwrap();
-            drop(stdlib);
+            drop(grammar_json_file);
 
-            let mut stdio = std::fs::File::create(sysroot_dir.join("stdio.h")).unwrap();
-            stdio
-                .write_all(include_bytes!("wasm-sysroot/stdio.h"))
+            let header_dir = dir.join("tree_sitter");
+            std::fs::create_dir(&header_dir).unwrap();
+            let mut parser_file = std::fs::File::create(header_dir.join("parser.h")).unwrap();
+            parser_file
+                .write_all(tree_sitter::PARSER_HEADER.as_bytes())
                 .unwrap();
-            drop(stdio);
+            drop(parser_file);
 
-            let mut stdbool = std::fs::File::create(sysroot_dir.join("stdbool.h")).unwrap();
-            stdbool
-                .write_all(include_bytes!("wasm-sysroot/stdbool.h"))
-                .unwrap();
-            drop(stdbool);
-        }
+            let sysroot_dir = dir.join("sysroot");
+            if env::var("TARGET").unwrap().starts_with("wasm32") {
+                std::fs::create_dir(&sysroot_dir).unwrap();
+                let mut stdint = std::fs::File::create(sysroot_dir.join("stdint.h")).unwrap();
+                stdint
+                    .write_all(include_bytes!("wasm-sysroot/stdint.h"))
+                    .unwrap();
+                drop(stdint);
 
-        let mut c_config = cc::Build::new();
-        c_config.include(&dir).include(&sysroot_dir);
-        c_config
-            .flag_if_supported("-Wno-unused-label")
-            .flag_if_supported("-Wno-unused-parameter")
-            .flag_if_supported("-Wno-unused-but-set-variable")
-            .flag_if_supported("-Wno-trigraphs")
-            .flag_if_supported("-Wno-everything");
-        c_config.file(dir.join("parser.c"));
+                let mut stdlib = std::fs::File::create(sysroot_dir.join("stdlib.h")).unwrap();
+                stdlib
+                    .write_all(include_bytes!("wasm-sysroot/stdlib.h"))
+                    .unwrap();
+                drop(stdlib);
 
-        c_config.compile(&grammar_name);
-    });
+                let mut stdio = std::fs::File::create(sysroot_dir.join("stdio.h")).unwrap();
+                stdio
+                    .write_all(include_bytes!("wasm-sysroot/stdio.h"))
+                    .unwrap();
+                drop(stdio);
+
+                let mut stdbool = std::fs::File::create(sysroot_dir.join("stdbool.h")).unwrap();
+                stdbool
+                    .write_all(include_bytes!("wasm-sysroot/stdbool.h"))
+                    .unwrap();
+                drop(stdbool);
+            }
+
+            let mut c_config = cc::Build::new();
+            c_config.include(&dir).include(&sysroot_dir);
+            c_config
+                .flag_if_supported("-Wno-unused-label")
+                .flag_if_supported("-Wno-unused-parameter")
+                .flag_if_supported("-Wno-unused-but-set-variable")
+                .flag_if_supported("-Wno-trigraphs")
+                .flag_if_supported("-Wno-everything");
+            c_config.file(dir.join("parser.c"));
+            if metadata.scanner_c.is_some() {
+                c_config.file(dir.join("scanner.c"));
+            }
+
+            c_config.compile(&grammar_name);
+        });
 }
 
 #[cfg(test)]
 mod tests {
     use syn::parse_quote;
+
+    use crate::Metadata;
 
     use super::generate_grammar;
 
@@ -161,7 +188,8 @@ mod tests {
             panic!()
         };
 
-        let grammar = generate_grammar(&m);
+        let (grammar, meta) = generate_grammar(&m);
+        assert_eq!(meta, Metadata::default());
         insta::assert_snapshot!(grammar);
         tree_sitter_cli::generate::generate_parser_for_grammar(&grammar.to_string()).unwrap();
     }
@@ -185,7 +213,8 @@ mod tests {
             panic!()
         };
 
-        let grammar = generate_grammar(&m);
+        let (grammar, meta) = generate_grammar(&m);
+        assert_eq!(meta, Metadata::default());
         insta::assert_snapshot!(grammar);
         tree_sitter_cli::generate::generate_parser_for_grammar(&grammar.to_string()).unwrap();
     }
@@ -214,7 +243,8 @@ mod tests {
             panic!()
         };
 
-        let grammar = generate_grammar(&m);
+        let (grammar, meta) = generate_grammar(&m);
+        assert_eq!(meta, Metadata::default());
         insta::assert_snapshot!(grammar);
         tree_sitter_cli::generate::generate_parser_for_grammar(&grammar.to_string()).unwrap();
     }
@@ -245,7 +275,8 @@ mod tests {
             panic!()
         };
 
-        let grammar = generate_grammar(&m);
+        let (grammar, meta) = generate_grammar(&m);
+        assert_eq!(meta, Metadata::default());
         insta::assert_snapshot!(grammar);
         tree_sitter_cli::generate::generate_parser_for_grammar(&grammar.to_string()).unwrap();
     }
@@ -275,7 +306,8 @@ mod tests {
             panic!()
         };
 
-        let grammar = generate_grammar(&m);
+        let (grammar, meta) = generate_grammar(&m);
+        assert_eq!(meta, Metadata::default());
         insta::assert_snapshot!(grammar);
         tree_sitter_cli::generate::generate_parser_for_grammar(&grammar.to_string()).unwrap();
     }
@@ -303,7 +335,8 @@ mod tests {
             panic!()
         };
 
-        let grammar = generate_grammar(&m);
+        let (grammar, meta) = generate_grammar(&m);
+        assert_eq!(meta, Metadata::default());
         insta::assert_snapshot!(grammar);
         tree_sitter_cli::generate::generate_parser_for_grammar(&grammar.to_string()).unwrap();
     }
@@ -339,7 +372,8 @@ mod tests {
             panic!()
         };
 
-        let grammar = generate_grammar(&m);
+        let (grammar, meta) = generate_grammar(&m);
+        assert_eq!(meta, Metadata::default());
         insta::assert_snapshot!(grammar);
         tree_sitter_cli::generate::generate_parser_for_grammar(&grammar.to_string()).unwrap();
     }
@@ -371,7 +405,8 @@ mod tests {
             panic!()
         };
 
-        let grammar = generate_grammar(&m);
+        let (grammar, meta) = generate_grammar(&m);
+        assert_eq!(meta, Metadata::default());
         insta::assert_snapshot!(grammar);
         tree_sitter_cli::generate::generate_parser_for_grammar(&grammar.to_string()).unwrap();
     }
@@ -408,7 +443,8 @@ mod tests {
             panic!()
         };
 
-        let grammar = generate_grammar(&m);
+        let (grammar, meta) = generate_grammar(&m);
+        assert_eq!(meta, Metadata::default());
         insta::assert_snapshot!(grammar);
         tree_sitter_cli::generate::generate_parser_for_grammar(&grammar.to_string()).unwrap();
     }
@@ -438,7 +474,8 @@ mod tests {
             panic!()
         };
 
-        let grammar = generate_grammar(&m);
+        let (grammar, meta) = generate_grammar(&m);
+        assert_eq!(meta, Metadata::default());
         insta::assert_snapshot!(grammar);
         tree_sitter_cli::generate::generate_parser_for_grammar(&grammar.to_string()).unwrap();
     }
@@ -467,7 +504,8 @@ mod tests {
             panic!()
         };
 
-        let grammar = generate_grammar(&m);
+        let (grammar, meta) = generate_grammar(&m);
+        assert_eq!(meta, Metadata::default());
         insta::assert_snapshot!(grammar);
         tree_sitter_cli::generate::generate_parser_for_grammar(&grammar.to_string()).unwrap();
     }
@@ -497,7 +535,8 @@ mod tests {
             panic!()
         };
 
-        let grammar = generate_grammar(&m);
+        let (grammar, meta) = generate_grammar(&m);
+        assert_eq!(meta, Metadata::default());
         insta::assert_snapshot!(grammar);
         tree_sitter_cli::generate::generate_parser_for_grammar(&grammar.to_string()).unwrap();
     }

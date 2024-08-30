@@ -1,0 +1,16 @@
+---
+source: example/src/externals.rs
+assertion_line: 33
+expression: "grammar::parse(\"23;; , ;;_.\")"
+---
+Ok(
+    Language {
+        v: Some(
+            23,
+        ),
+        _s: (),
+        _d: Some(
+            (),
+        ),
+    },
+)

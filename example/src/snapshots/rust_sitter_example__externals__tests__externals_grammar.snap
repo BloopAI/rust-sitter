@@ -1,0 +1,12 @@
+---
+source: example/src/externals.rs
+assertion_line: 22
+expression: "grammar::parse(\"_\")"
+---
+Ok(
+    Language {
+        v: None,
+        _s: (),
+        _d: None,
+    },
+)

@@ -4,7 +4,7 @@ use crate::errors::IteratorExt as _;
 use proc_macro2::Span;
 use quote::{quote, ToTokens};
 use rust_sitter_common::*;
-use syn::{parse::Parse, punctuated::Punctuated, *};
+use syn::{punctuated::Punctuated, *};
 
 fn is_sitter_attr(attr: &Attribute) -> bool {
     attr.path
@@ -163,30 +163,21 @@ fn gen_struct_or_variant(
 }
 
 pub fn expand_grammar(input: ItemMod) -> Result<ItemMod> {
-    let grammar_name = input
+    let grammar_attr = input
         .attrs
         .iter()
-        .find_map(|a| {
-            if a.path == syn::parse_quote!(rust_sitter::grammar) {
-                let grammar_name_expr = a.parse_args_with(Expr::parse).ok();
-                if let Some(Expr::Lit(ExprLit {
-                    attrs: _,
-                    lit: Lit::Str(s),
-                })) = grammar_name_expr
-                {
-                    Some(Ok(s.value()))
-                } else {
-                    Some(Err(syn::Error::new(
-                        Span::call_site(),
-                        "Expected a string literal grammar name",
-                    )))
-                }
-            } else {
-                None
-            }
-        })
-        .transpose()?
-        .ok_or_else(|| syn::Error::new(Span::call_site(), "Each grammar must have a name"))?;
+        .find(|a| a.path == syn::parse_quote!(rust_sitter::grammar))
+        .expect("Each grammar must have a name");
+
+    let grammar_arg_exprs = grammar_attr
+        .parse_args_with(Punctuated::<LitStr, Token![,]>::parse_terminated)
+        .unwrap_or_else(|_| panic!("Expected string literal arguments"));
+    let mut grammar_arg_exprs = grammar_arg_exprs.into_iter();
+
+    let grammar_name = grammar_arg_exprs
+        .next()
+        .unwrap_or_else(|| panic!("Expected at least one argument giving grammar name"))
+        .value();
 
     let (brace, new_contents) = input.content.ok_or_else(|| {
         syn::Error::new(

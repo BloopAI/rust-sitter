@@ -4,6 +4,8 @@ use rust_sitter_common::*;
 use serde_json::{json, Map, Value};
 use syn::{parse::Parse, punctuated::Punctuated, *};
 
+use crate::Metadata;
+
 fn gen_field(
     path: String,
     leaf_type: Type,
@@ -387,33 +389,44 @@ fn gen_struct_or_variant(
     out.insert(path, rule);
 }
 
-pub fn generate_grammar(module: &ItemMod) -> Value {
+pub fn generate_grammar(module: &ItemMod) -> (Value, Metadata) {
+    let mut metadata = Metadata::default();
+
     let mut rules_map = Map::new();
     // for some reason, source_file must be the first key for things to work
     rules_map.insert("source_file".to_string(), json!({}));
 
     let mut extras_list = vec![];
+    let mut externals_list = vec![];
+    let mut external_token_types = vec![];
 
-    let grammar_name = module
+    let grammar_attr = module
         .attrs
         .iter()
-        .find_map(|a| {
-            if a.path == syn::parse_quote!(rust_sitter::grammar) {
-                let grammar_name_expr = a.parse_args_with(Expr::parse).ok();
-                if let Some(Expr::Lit(ExprLit {
-                    attrs: _,
-                    lit: Lit::Str(s),
-                })) = grammar_name_expr
-                {
-                    Some(s.value())
-                } else {
-                    panic!("Expected string literal for grammar name");
-                }
-            } else {
-                None
-            }
-        })
+        .find(|a| a.path == syn::parse_quote!(rust_sitter::grammar))
         .expect("Each grammar must have a name");
+
+    let grammar_arg_exprs = grammar_attr
+        .parse_args_with(Punctuated::<LitStr, Token![,]>::parse_terminated)
+        .unwrap_or_else(|_| panic!("Expected string literal arguments"));
+    let mut grammar_arg_exprs = grammar_arg_exprs.into_iter();
+
+    let grammar_name = grammar_arg_exprs
+        .next()
+        .unwrap_or_else(|| panic!("Expected at least one argument giving grammar name"))
+        .value();
+
+    if let Some(scannar_name) = grammar_arg_exprs.next() {
+        let scannar_name = scannar_name.value();
+        let mut scannar_name = std::path::PathBuf::from(scannar_name);
+        if let Ok(absolute) = std::path::absolute(scannar_name.as_path()) {
+            scannar_name = absolute;
+        }
+        let scanner_c = std::fs::read_to_string(&scannar_name).unwrap_or_else(|err| {
+            panic!("could not read file `{}`: {err}", scannar_name.display())
+        });
+        metadata.scanner_c = Some(scanner_c)
+    }
 
     let (_, contents) = module.content.as_ref().unwrap();
 
@@ -440,50 +453,64 @@ pub fn generate_grammar(module: &ItemMod) -> Value {
     let mut word_rule = None;
     contents.iter().for_each(|c| {
         let (symbol, attrs) = match c {
-            Item::Enum(e) => {
-                e.variants.iter().for_each(|v| {
-                    gen_struct_or_variant(
-                        format!("{}_{}", e.ident, v.ident),
-                        v.attrs.clone(),
-                        v.fields.clone(),
-                        &mut rules_map,
-                        &mut word_rule,
-                    )
-                });
+            Item::Enum(e) => (e.ident.to_string(), e.attrs.clone()),
 
-                let mut members: Vec<Value> = vec![];
-                e.variants.iter().for_each(|v| {
-                    let variant_path = format!("{}_{}", e.ident.clone(), v.ident);
-                    members.push(json!({
-                        "type": "SYMBOL",
-                        "name": variant_path
-                    }))
-                });
-
-                let rule = json!({
-                    "type": "CHOICE",
-                    "members": members
-                });
-
-                rules_map.insert(e.ident.to_string(), rule);
-
-                (e.ident.to_string(), e.attrs.clone())
-            }
-
-            Item::Struct(s) => {
-                gen_struct_or_variant(
-                    s.ident.to_string(),
-                    s.attrs.clone(),
-                    s.fields.clone(),
-                    &mut rules_map,
-                    &mut word_rule,
-                );
-
-                (s.ident.to_string(), s.attrs.clone())
-            }
+            Item::Struct(s) => (s.ident.to_string(), s.attrs.clone()),
 
             _ => return,
         };
+        if attrs
+            .iter()
+            .any(|a| a.path == syn::parse_quote!(rust_sitter::external))
+        {
+            externals_list.push(json!({
+                "type": "SYMBOL",
+                "name": symbol
+            }));
+            external_token_types.push(symbol.clone())
+        } else {
+            match c {
+                Item::Enum(e) => {
+                    e.variants.iter().for_each(|v| {
+                        gen_struct_or_variant(
+                            format!("{}_{}", e.ident, v.ident),
+                            v.attrs.clone(),
+                            v.fields.clone(),
+                            &mut rules_map,
+                            &mut word_rule,
+                        )
+                    });
+
+                    let mut members: Vec<Value> = vec![];
+                    e.variants.iter().for_each(|v| {
+                        let variant_path = format!("{}_{}", e.ident.clone(), v.ident);
+                        members.push(json!({
+                            "type": "SYMBOL",
+                            "name": variant_path
+                        }))
+                    });
+
+                    let rule = json!({
+                        "type": "CHOICE",
+                        "members": members
+                    });
+
+                    rules_map.insert(e.ident.to_string(), rule);
+                }
+
+                Item::Struct(s) => {
+                    gen_struct_or_variant(
+                        s.ident.to_string(),
+                        s.attrs.clone(),
+                        s.fields.clone(),
+                        &mut rules_map,
+                        &mut word_rule,
+                    );
+                }
+
+                _ => return,
+            }
+        }
 
         if attrs
             .iter()
@@ -501,10 +528,34 @@ pub fn generate_grammar(module: &ItemMod) -> Value {
         rules_map.get(&root_type).unwrap().clone(),
     );
 
-    json!({
-        "name": grammar_name,
-        "word": word_rule,
-        "rules": rules_map,
-        "extras": extras_list
-    })
+    // If there are any external tokens, generate a header to include by the custom scanner.
+    if metadata.scanner_c.is_some() {
+        let external_token_types: String = external_token_types
+            .into_iter()
+            .map(|mut s| {
+                s += ",\n";
+                s
+            })
+            .collect();
+        let other_header = metadata.extra_headers.insert(
+            "token_types".to_owned(),
+            format!(
+                "enum TokenType {{
+                    {external_token_types}
+                }};"
+            ),
+        );
+        assert!(other_header.is_none())
+    }
+
+    (
+        json!({
+            "name": grammar_name,
+            "word": word_rule,
+            "rules": rules_map,
+            "extras": extras_list,
+            "externals": externals_list
+        }),
+        metadata,
+    )
 }
